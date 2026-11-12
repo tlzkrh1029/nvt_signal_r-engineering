@@ -14,10 +14,22 @@
 // From metaInfo only (not observable in plot values): alert titles/messages, input minimums, hidden styles,
 // label transparency. The alert conditions themselves are inferred from their titles.
 //
-// Note: the QUANDL BCHAIN feeds stopped producing new bars after 2026-06-22. Since then NVT (original and this
-// script alike) is Bitstamp close x a constant, so recent readings follow price only.
+// Note: in Sept 2026 the BCHAIN feeds had no bars after 2026-06-22, so NVT (original and this script alike) was
+// Bitstamp close x a constant from then on. By 2026-11-12 BCHAIN:ETRVU/TOTBC had bars up to 2026-11-11 (the gap
+// was backfilled) and older values had been revised, so bars drawn earlier changed in both scripts.
 //
 // NVT = Bitstamp close x total supply / SMA(estimated on-chain tx volume in USD, Transaction Period)
+//
+// Non-repainting option (added; off by default, so with it off every plot is exactly the original's):
+// BCHAIN publishes a day's value about one day later, so the original first draws a bar with the previous
+// day's on-chain value and changes it once the late value arrives (on intraday charts the daily price also
+// develops live). With the option on, a bar uses only on-chain values dated at least "On-chain publication
+// lag" days before the bar's last day, which are already published when the bar closes, and the same rule
+// picks the same dated values in history and in real time. A closed bar's value then never changes, unless the
+// data vendor revises or backfills values it had already published (no script can prevent that), or the vendor is
+// later than the lag, in which case a grey (na) closed bar gets its value after a reload. On a closed
+// bar whose on-chain value is still missing NVT and Signal are na (grey background) and the Signal EMA skips
+// that bar; the live bar shows a provisional value.
 //
 indicator("NVT - Network Value to Transactions", shorttitle = "NVT", overlay = false)
 
@@ -37,6 +49,11 @@ manualLevels = input.bool(false, "Manual Above/Below Value Levels")
 manualAbove  = input.int(150,    "Manual Above-Value Level", minval = 1)
 manualBelow  = input.int(45,     "Manual Below-Value Level", minval = 1)
 showLabels   = input.bool(false, "Show Labels")
+// Added after the original inputs, so saved settings keep their positions
+noRepaint    = input.bool(false, "Non-repainting (use confirmed on-chain data only)", group = "Non-repainting",
+     tooltip = "Off: identical to the original. On: each bar uses only on-chain values that are already published when the bar closes, so a closed bar's value never changes (vendor revisions excepted; a grey bar can still fill in later if the vendor is later than the lag). Use alerts with 'Once Per Bar Close'.")
+lagDays      = input.int(2, "On-chain publication lag (days)", minval = 1, maxval = 5, group = "Non-repainting",
+     tooltip = "Days between a bar's last day and the newest on-chain value it may use. BCHAIN publishes a day's value within about a day, so 1 is the minimum allowed (0 would use values not yet published at the bar's close; each bar at 1 then keeps what the original showed live when the bar closed). 2 also absorbs a missing or late vendor day without touching closed bars, at the cost of one more day of delay.")
 
 //Data (the original's values match these bit for bit on 1D and 1W)
 priceSymbol  = "BITSTAMP:BTCUSD"       // price; its history starts 2011-08-18, hence the original's first bar
@@ -51,7 +68,59 @@ dataTf  = forceDaily or timeframe.isintraday ? "D" : timeframe.period
 bsClose = request.security(priceSymbol, dataTf, close)
 volSma  = request.security(volSymbol, dataTf, ta.sma(close, txPeriod))
 supply  = request.security(supplySymbol, "D", close)
-nvt = bsClose * supply / volSma
+nvtOrig = bsClose * supply / volSma
+
+//Non-repainting variant (used only when the input is on)
+// The last 7 daily bars of a series with their dates, evaluated on the data symbol's own bars.
+lastBars(float src) =>
+    [time, src, time[1], src[1], time[2], src[2], time[3], src[3], time[4], src[4], time[5], src[5], time[6], src[6]]
+
+// In the chart context: the newest of those values dated on or before `cutoff` (na if none is).
+asOf(int cutoff, int t0, float v0, int t1, float v1, int t2, float v2, int t3, float v3, int t4, float v4, int t5, float v5, int t6, float v6) =>
+    t0 <= cutoff ? v0 : t1 <= cutoff ? v1 : t2 <= cutoff ? v2 : t3 <= cutoff ? v3 : t4 <= cutoff ? v4 : t5 <= cutoff ? v5 : t6 <= cutoff ? v6 : na
+
+// The date of that value.
+asOfTime(int cutoff, int t0, int t1, int t2, int t3, int t4, int t5, int t6) =>
+    t0 <= cutoff ? t0 : t1 <= cutoff ? t1 : t2 <= cutoff ? t2 : t3 <= cutoff ? t3 : t4 <= cutoff ? t4 : t5 <= cutoff ? t5 : t6 <= cutoff ? t6 : na
+// On the data symbol's own bars of the chart timeframe: the open time of the last 4 bars and the sum of the
+// txPeriod - 1 bars before each of them.
+htfSums(int n) =>
+    s = math.sum(close, math.max(n - 1, 1))
+    [time, s[1], time[1], s[2], time[2], s[3], time[3], s[4]]
+
+DAY_MS = 86400000
+// Last day whose daily values are final when the bar closes (UTC, like the data symbols): the bar's own last
+// day on 1D and above; the previous day on intraday, where the current day is still developing.
+dayStart = time - time % DAY_MS
+lastDay  = timeframe.isintraday ? dayStart - DAY_MS : (time_close - 1) - (time_close - 1) % DAY_MS
+cutoff   = lastDay - lagDays * DAY_MS
+
+// Daily candidates. lookahead stays off: history returns the bar's own (or last earlier) daily bar, real time
+// returns the newest published one, and asOf() picks the same dated value from either.
+[pT0, pV0, pT1, pV1, pT2, pV2, pT3, pV3, pT4, pV4, pT5, pV5, pT6, pV6] = request.security(priceSymbol, "D", lastBars(close))
+[sT0, sV0, sT1, sV1, sT2, sV2, sT3, sV3, sT4, sV4, sT5, sV5, sT6, sV6] = request.security(supplySymbol, "D", lastBars(close))
+[aT0, aV0, aT1, aV1, aT2, aV2, aT3, aV3, aT4, aV4, aT5, aV5, aT6, aV6] = request.security(volSymbol, "D", lastBars(ta.sma(close, txPeriod)))
+[cT0, cV0, cT1, cV1, cT2, cV2, cT3, cV3, cT4, cV4, cT5, cV5, cT6, cV6] = request.security(volSymbol, "D", lastBars(close))
+// Weekly/monthly etc. (Force Daily off): the original's SMA over the data symbol's own bars as it stood on the
+// cutoff day, i.e. (sum of the txPeriod - 1 bars before the bar holding the cutoff sample + that sample) / txPeriod.
+// The bar is chosen by its open time, so history and real time use the same bars. lookahead on only
+// exposes open times and sums of completed bars (no future data).
+[hO0, hS0, hO1, hS1, hO2, hS2, hO3, hS3] = request.security(volSymbol, dataTf, htfSums(txPeriod), lookahead = barmerge.lookahead_on)
+
+dailyData = timeframe.in_seconds(dataTf) == 86400
+nrPrice   = timeframe.isintraday ? asOf(lastDay, pT0, pV0, pT1, pV1, pT2, pV2, pT3, pV3, pT4, pV4, pT5, pV5, pT6, pV6) : bsClose
+nrSupply  = asOf(cutoff, sT0, sV0, sT1, sV1, sT2, sV2, sT3, sV3, sT4, sV4, sT5, sV5, sT6, sV6)
+nrSample  = asOf(cutoff, cT0, cV0, cT1, cV1, cT2, cV2, cT3, cV3, cT4, cV4, cT5, cV5, cT6, cV6)
+sampleT   = asOfTime(cutoff, cT0, cT1, cT2, cT3, cT4, cT5, cT6)
+prevSum   = hO0 <= sampleT ? hS0 : hO1 <= sampleT ? hS1 : hO2 <= sampleT ? hS2 : hO3 <= sampleT ? hS3 : na
+nrVolSma  = dailyData ? asOf(cutoff, aT0, aV0, aT1, aV1, aT2, aV2, aT3, aV3, aT4, aV4, aT5, aV5, aT6, aV6) :
+     ((txPeriod > 1 ? prevSum : 0.0) + nrSample) / txPeriod
+// Confirmed: each source has published a bar dated on or after the cutoff, so the picked value is final.
+nrConfirmed = (not timeframe.isintraday or pT0 >= lastDay) and sT0 >= cutoff and
+     (dailyData ? aT0 >= cutoff : cT0 >= cutoff and (txPeriod == 1 or not na(prevSum)))
+nvtNr = nrPrice * nrSupply / nrVolSma
+// Closed bars (all history, and the closing update of a live bar) show confirmed values only.
+nvt = noRepaint ? (nrConfirmed or not barstate.isconfirmed ? nvtNr : na) : nvtOrig
 
 //Levels: automatic per timeframe class, or manual
 autoAbove = timeframe.ismonthly ? 1000.0 : timeframe.isweekly ? 450.0 : timeframe.isintraday ? 200.0 : 150.0
@@ -91,7 +160,13 @@ plotshape(showLabels and barstate.islast ? nvt : na, "Shapes", style = shape.lab
      color = color.new(neutral, 30), textcolor = color.new(labelText, 30), text = "NVT", size = size.tiny, editable = false)
 
 //Signal line and crosses
-signal = ta.ema(nvt, signalLen)
+emaOrig = ta.ema(nvt, signalLen)
+// Non-repainting: the same EMA over confirmed values only; a bar without confirmed data is skipped (na there)
+// instead of being fed to the average, so the result does not depend on how ta.ema treats na.
+var float nrSignal = na
+if noRepaint and not na(nvt)
+    nrSignal := na(nrSignal) ? nvt : nrSignal + 2.0 / (signalLen + 1) * (nvt - nrSignal)
+signal = noRepaint ? (na(nvt) ? na : nrSignal) : emaOrig
 plot(showSignal ? signal : na, "Signal", color = #FF7F00)
 bullCross = ta.crossover(nvt, signal)
 bearCross = ta.crossunder(nvt, signal)
@@ -105,3 +180,7 @@ alertcondition(isBelow, "1b. Below-Value Condition", "NVT in Below-Value Conditi
 alertcondition(bullCross or bearCross, "2. Signal Line Cross", "NVT Signal Line Cross!")
 alertcondition(bullCross, "2a. Bullish Signal Line Cross", "NVT Bullish Signal Line Cross!")
 alertcondition(bearCross, "2b. Bearish Signal Line Cross", "NVT Bearish Signal Line Cross!")
+
+// Non-repainting: grey background where on-chain data for the bar is not confirmed yet (added last so the
+// original plots keep their positions)
+bgcolor(noRepaint and not nrConfirmed ? color.new(#808080, 80) : na, title = "Waiting for On-Chain Data", editable = false)

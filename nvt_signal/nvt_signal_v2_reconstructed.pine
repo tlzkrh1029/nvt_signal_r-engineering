@@ -12,17 +12,92 @@
 //
 // Glassnode data on TradingView arrives about two days late, so the last bars repeat the latest known value.
 //
+// Non-repainting option (added; off by default, so with it off both plots are exactly the original's):
+// because of that delay the original first draws a bar with an older Glassnode value and changes it when the
+// late values arrive (a 1D bar changes up to twice after it has closed). With the option on, a bar uses only
+// Glassnode values dated at least "On-chain publication lag" days before the bar's last day, which are already
+// published when the bar closes, and the same rule picks the same dated values in history and in real time.
+// On 1D the line is then the final NVT of 3 days earlier (default lag). A closed bar's value never changes,
+// unless the data vendor revises or backfills values it had already published (no script can prevent that), or
+// Glassnode is later than the lag, in which case a grey (na) closed bar gets its value after a reload. On a
+// closed bar whose Glassnode value is still missing NVT and Signal are na (grey background) and the Signal EMA
+// skips that bar; the live bar shows a provisional value.
+//
 indicator("NVT - Network Value to Transactions", shorttitle = "NVT", overlay = false)
 
 txPeriod   = input.int(90,    "Transaction Period", minval = 1)
 forceDaily = input.bool(true, "Force Daily View across all Time Frames")
 showSignal = input.bool(true, "Show Signal Line")
 signalLen  = input.int(13,    "Length Signal", minval = 1)
+// Added after the original inputs, so saved settings keep their positions
+noRepaint  = input.bool(false, "Non-repainting (use confirmed on-chain data only)", group = "Non-repainting",
+     tooltip = "Off: identical to the original. On: each bar uses only Glassnode values that are already published when the bar closes, so a closed bar's value never changes (vendor revisions excepted; a grey bar can still fill in later if Glassnode is later than the lag). Use alerts with 'Once Per Bar Close'.")
+lagDays    = input.int(3, "On-chain publication lag (days)", minval = 2, maxval = 5, group = "Non-repainting",
+     tooltip = "Days between a bar's last day and the newest Glassnode value it may use. Glassnode on TradingView publishes a day's value about two days later, so 2 is the minimum allowed (less would use values not yet published at the bar's close; each bar at 2 then keeps what the original showed live when the bar closed). 3 also absorbs a missing or late vendor day without touching closed bars, at the cost of one more day of delay.")
+
+capSymbol = "GLASSNODE:BTC_MARKETCAP"
+volSymbol = "GLASSNODE:BTC_TOTALVOLUMEUSD"
 
 cap    = request.security("GLASSNODE:BTC_MARKETCAP", timeframe.period, close)
 volSma = request.security("GLASSNODE:BTC_TOTALVOLUMEUSD", timeframe.period, ta.sma(close, txPeriod))
-nvt    = cap / volSma
-signal = ta.ema(nvt, signalLen)
+nvtOrig = cap / volSma
+
+//Non-repainting variant (used only when the input is on)
+// The last 7 daily bars of a series with their dates, evaluated on the data symbol's own bars.
+lastBars(float src) =>
+    [time, src, time[1], src[1], time[2], src[2], time[3], src[3], time[4], src[4], time[5], src[5], time[6], src[6]]
+
+// In the chart context: the newest of those values dated on or before `cutoff` (na if none is).
+asOf(int cutoff, int t0, float v0, int t1, float v1, int t2, float v2, int t3, float v3, int t4, float v4, int t5, float v5, int t6, float v6) =>
+    t0 <= cutoff ? v0 : t1 <= cutoff ? v1 : t2 <= cutoff ? v2 : t3 <= cutoff ? v3 : t4 <= cutoff ? v4 : t5 <= cutoff ? v5 : t6 <= cutoff ? v6 : na
+
+// The date of that value.
+asOfTime(int cutoff, int t0, int t1, int t2, int t3, int t4, int t5, int t6) =>
+    t0 <= cutoff ? t0 : t1 <= cutoff ? t1 : t2 <= cutoff ? t2 : t3 <= cutoff ? t3 : t4 <= cutoff ? t4 : t5 <= cutoff ? t5 : t6 <= cutoff ? t6 : na
+// On the data symbol's own bars of the chart timeframe: the open time of the last 4 bars and the sum of the
+// txPeriod - 1 bars before each of them.
+htfSums(int n) =>
+    s = math.sum(close, math.max(n - 1, 1))
+    [time, s[1], time[1], s[2], time[2], s[3], time[3], s[4]]
+
+DAY_MS = 86400000
+// Last day whose daily values are final when the bar closes (UTC, like the data symbols): the bar's own last
+// day on 1D and above; the previous day on intraday, where the current day is still developing.
+dayStart = time - time % DAY_MS
+lastDay  = timeframe.isintraday ? dayStart - DAY_MS : (time_close - 1) - (time_close - 1) % DAY_MS
+cutoff   = lastDay - lagDays * DAY_MS
+nrTf     = timeframe.isintraday ? "D" : timeframe.period
+
+// Daily candidates. lookahead stays off: history returns the bar's own (or last earlier) daily bar, real time
+// returns the newest published one, and asOf() picks the same dated value from either.
+[mT0, mV0, mT1, mV1, mT2, mV2, mT3, mV3, mT4, mV4, mT5, mV5, mT6, mV6] = request.security(capSymbol, "D", lastBars(close))
+[aT0, aV0, aT1, aV1, aT2, aV2, aT3, aV3, aT4, aV4, aT5, aV5, aT6, aV6] = request.security(volSymbol, "D", lastBars(ta.sma(close, txPeriod)))
+[cT0, cV0, cT1, cV1, cT2, cV2, cT3, cV3, cT4, cV4, cT5, cV5, cT6, cV6] = request.security(volSymbol, "D", lastBars(close))
+// 2D and above: the original's SMA over the data symbol's own bars as it stood on the cutoff day, i.e.
+// (sum of the txPeriod - 1 bars before the bar holding the cutoff sample + that sample) / txPeriod.
+// The bar is chosen by its open time, so history and real time use the same bars. lookahead on only
+// exposes open times and sums of completed bars (no future data).
+[hO0, hS0, hO1, hS1, hO2, hS2, hO3, hS3] = request.security(volSymbol, nrTf, htfSums(txPeriod), lookahead = barmerge.lookahead_on)
+
+dailyData = timeframe.in_seconds(nrTf) == 86400
+nrCap     = asOf(cutoff, mT0, mV0, mT1, mV1, mT2, mV2, mT3, mV3, mT4, mV4, mT5, mV5, mT6, mV6)
+nrSample  = asOf(cutoff, cT0, cV0, cT1, cV1, cT2, cV2, cT3, cV3, cT4, cV4, cT5, cV5, cT6, cV6)
+sampleT   = asOfTime(cutoff, cT0, cT1, cT2, cT3, cT4, cT5, cT6)
+prevSum   = hO0 <= sampleT ? hS0 : hO1 <= sampleT ? hS1 : hO2 <= sampleT ? hS2 : hO3 <= sampleT ? hS3 : na
+nrVolSma  = dailyData ? asOf(cutoff, aT0, aV0, aT1, aV1, aT2, aV2, aT3, aV3, aT4, aV4, aT5, aV5, aT6, aV6) :
+     ((txPeriod > 1 ? prevSum : 0.0) + nrSample) / txPeriod
+// Confirmed: each source has published a bar dated on or after the cutoff, so the picked value is final.
+nrConfirmed = mT0 >= cutoff and (dailyData ? aT0 >= cutoff : cT0 >= cutoff and (txPeriod == 1 or not na(prevSum)))
+nvtNr = nrCap / nrVolSma
+// Closed bars (all history, and the closing update of a live bar) show confirmed values only.
+nvt    = noRepaint ? (nrConfirmed or not barstate.isconfirmed ? nvtNr : na) : nvtOrig
+emaOrig = ta.ema(nvt, signalLen)
+// Non-repainting: the same EMA over confirmed values only; a bar without confirmed data is skipped (na there)
+// instead of being fed to the average, so the result does not depend on how ta.ema treats na.
+var float nrSignal = na
+if noRepaint and not na(nvt)
+    nrSignal := na(nrSignal) ? nvt : nrSignal + 2.0 / (signalLen + 1) * (nvt - nrSignal)
+signal = noRepaint ? (na(nvt) ? na : nrSignal) : emaOrig
 
 plot(nvt, "NVT", color = #787B86, linewidth = 2)
 plot(showSignal ? signal : na, "Signal", color = #FF9800)
@@ -30,3 +105,7 @@ plot(showSignal ? signal : na, "Signal", color = #FF9800)
 alertcondition(ta.cross(nvt, signal),      "2. Signal Line Cross",          "NVT Signal Line Cross!")
 alertcondition(ta.crossover(nvt, signal),  "2a. Bullish Signal Line Cross", "NVT Bullish Signal Line Cross!")
 alertcondition(ta.crossunder(nvt, signal), "2b. Bearish Signal Line Cross", "NVT Bearish Signal Line Cross!")
+
+// Non-repainting: grey background where on-chain data for the bar is not confirmed yet (added last so the
+// original plots keep their positions)
+bgcolor(noRepaint and not nrConfirmed ? color.new(#808080, 80) : na, title = "Waiting for On-Chain Data", editable = false)
